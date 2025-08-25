@@ -10,7 +10,7 @@ TIGIT KO and wild-type mouse T cells were sorted and collected from the lung and
 
 ## Dataset location
 
-The datasets can be found in (https://zenodo.org/records/14041419)[this] Zenodo archive
+The processed and raw datasets can be found and downloaded in [Zenodo](https://zenodo.org/records/14041419).
 
 tigit-full-dataset.rds: contains the full processed dataset ~198645 cells and 25906 genes formatted as a Seurat (v5) object
 
