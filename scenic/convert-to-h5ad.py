@@ -1,0 +1,8 @@
+setwd("~/current_work/tigit/")
+library(Seurat)
+library(ggplot2)
+library(gtools)
+seu = readRDS("dataset.rds")
+library(zellkonverter)
+pnet_obj <- as.SingleCellExperiment(seu, assay = c("RNA"))
+writeH5AD(pnet_obj, "tigit-final.h5ad", X_name = 'counts')

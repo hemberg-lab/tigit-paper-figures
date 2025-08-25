@@ -1,0 +1,413 @@
+#+TITLE: Scenic Analysis
+#+Author: Nikos Patikas
+#+PROPERTY: header-args:python :async yes :session tmp*python* :noweb yes :pandoc t :kernel main
+
+* Prepare objects for scenic analysis
+The scenic package works only with loom files. Therefore we will convert to h5ad and then use scanpy to export the appropriate loom objects.
+
+** Convert R object to h5ad
+We use zellkonverter to convert the whole dataset to scanpy object. We export only the raw counts because only these are needed in scenic.
+
+#+name: export_main_scenic_object 
+#+begin_src R :tangle /home/main/git/tigit-paper-figures/scenic/convert-to-h5ad.py
+setwd("~/current_work/tigit/")
+library(Seurat)
+library(ggplot2)
+library(gtools)
+seu = readRDS("dataset.rds")
+library(zellkonverter)
+pnet_obj <- as.SingleCellExperiment(seu, assay = c("RNA"))
+writeH5AD(pnet_obj, "tigit-final.h5ad", X_name = 'counts')
+
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Loading required package: SeuratObject
+Loading required package: sp
+The legacy packages maptools, rgdal, and rgeos, underpinning this package
+will retire shortly. Please refer to R-spatial evolution reports on
+https://r-spatial.org/r/2023/05/15/evolution4.html for details.
+This package is now running under evolution status 0 
+
+Attaching package: ‘SeuratObject’
+
+The following object is masked from ‘package:base’:
+
+    intersect
+
+Registered S3 method overwritten by 'zellkonverter':
+  method                from      
+  py_to_r.numpy.ndarray reticulate
+#+end_example
+
+** Training data set for scenic
+We will be generating a training dataset consisting from Tregs and CD8s. To avoid scenic picking up systematic biases in the data we will be sampling from each condition celltype ~{CD4,CD8}x{WT,KO}x{Naive,LCMV}~ we will include an equal number of cells from each condition. We will use this to run scenic and then we are going to project independent datasets to the identified signatures.
+
+The dataset size is going to look like the following:
+
+|          | Treg |  CD8 |
+|----------+------+------|
+| WT_Naive | 5000 | 5000 |
+| WT_LCMV  | 5000 | 5000 |
+| KO_LCMV  | 5000 | 5000 |
+| WT_Naive | 5000 | 5000 |
+
+#+name: scenic_training dataset
+#+begin_src python
+## train_data
+%cd ~/current_work/tigit/
+import scanpy as sc
+
+ann = sc.read_h5ad("tigit-final.h5ad")
+
+ann.var["Gene"] = ann.var_names
+ann.obs["CellID"] = ann.obs_names
+
+def sample_data(ann, sample_size=5000):
+    groups = ann.obs.groupby(["CellType", "Condition", "Genotype"]).sample(sample_size)
+    return ann[ann.obs.index.isin(groups.index)]
+ann_sample = sample_data(ann[(ann.obs["CellType"].isin(["Treg", "CD8"]))])
+ann_sample.obs["sample_condition"] = ann_sample.obs[["Condition", "Genotype"]].apply(lambda x: "_".join(x), axis=1)
+
+## Write object
+ann_sample.write_loom("scenic-results/Treg-CD8-comb.loom")
+
+#+end_src
+
+#+begin_src python
+ann_sample.obs.groupby(["sample_condition", "CellType"]).size().unstack()
+#+end_src
+
+#+RESULTS:
+:RESULTS:
+
+| CellType         | CD8  | Treg |
+|------------------+------+------|
+| sample_condition |      |      |
+| LCMV_KO          | 5000 | 5000 |
+| LCMV_WT          | 5000 | 5000 |
+| Naive_KO         | 5000 | 5000 |
+| Naive_WT         | 5000 | 5000 |
+:END:
+
+** Test dataset for SCENIC
+:PROPERTIES:
+:header-args:python: :async yes :session test-data-scenic*python* :noweb yes :pandoc t :kernel main
+:END:
+
+The next step is to generate the objects that we are going to use for AUCell from scenic. For this step we are going to pack the rest of the data, the ones that we did not use to run Scenic according to the condition. In this scenario we also want to test Tconv cells, so we are going to drop the cells we already included in the Scenic loom reference and export the rest of the dataset in the respective objects.
+
+
+#+begin_src python
+%cd ~/current_work/tigit/
+import pandas as pd
+import scanpy as sc
+ann = sc.read_h5ad("tigit-final.h5ad")
+ann.var["Gene"] = ann.var_names
+ann.obs["CellID"] = ann.obs_names
+ann_sample = sc.read_loom("scenic-results/Treg-CD8-comb.loom")
+ann_compl = ann[~ann.obs_names.isin(ann_sample.obs_names)].copy()
+ann_compl.obs["sample_condition"] = ann_compl.obs[["Condition", "Genotype"]].apply(lambda x: "_".join(x), axis=1)
+
+ann_compl.obs.groupby(["sample_condition", "CellType"], observed = False).size().unstack()
+
+#+end_src
+
+#+RESULTS:
+:RESULTS:
+: /home/main/current_work/tigit
+| CellType         | CD4   | CD8   | Treg |
+|------------------+-------+-------+------|
+| sample_condition |       |       |      |
+| LCMV_KO          | 21512 | 21670 | 5386 |
+| LCMV_WT          | 15920 | 17601 | 7620 |
+| Naive_KO         | 18978 | 6207  | 7326 |
+| Naive_WT         | 20996 | 13899 | 1530 |
+:END:
+
+
+
+
+We will be generating 6 datasets ~{CD8,Treg,Tconv}x{LCMV,Naive}~ to focus the AUCell scores on the effect of the TIGIT phenotype. Our goal is to include equal number of cells between conditions ~{TIGIT,KO}~. We have plenty of cells for most conditions except the Treg Naive_WT condition. Our strategy to avoid biases due to insufficient sampling, is to sample the minimum amount of cells between WT and KO.
+
+#+begin_src python
+sample_size = ann_compl.obs.groupby(["sample_condition", "CellType"], observed = False).size().min()
+for group, _df in ann.obs.groupby(["CellType", "Condition"], observed=False):
+    fn = f"scenic-results/test_{'_'.join(group)}.loom"
+    print(fn)
+    __df_sample = _df.groupby("Genotype", observed=False).sample(sample_size)
+    ann_compl[ann_compl.obs_names.isin(__df_sample.index)].write_loom(fn)
+
+
+#+end_src
+
+#+RESULTS:
+#+begin_example
+scenic-results/test_CD4_Naive.loom
+scenic-results/test_CD4_LCMV.loom
+scenic-results/test_CD8_Naive.loom
+scenic-results/test_CD8_LCMV.loom
+scenic-results/test_Treg_Naive.loom
+scenic-results/test_Treg_LCMV.loom
+#+end_example
+
+#+begin_src python
+import itertools
+sample_size = ann_compl.obs.groupby(["sample_condition", "CellType"], observed = False).size().min()
+bcs = []
+for group, _df in ann.obs.groupby(["CellType", "Condition", "Genotype"], observed=False):
+    bcs.append(_df.sample(min(len(_df), 5000)).index)
+    
+bcs_test = itertools.chain.from_iterable(bcs)
+ann_test = ann_compl[ann_compl.obs_names.isin(bcs_test)]
+ann_test.write_loom("scenic-results/all-cond-test-set.loom")
+#+end_src
+
+#+RESULTS:
+: The loom file will lack these fields:
+: {'PCA', 'HARMONY', 'UMAP'}
+: Use write_obsm_varm=True to export multi-dimensional annotations
+
+#+begin_src python
+ann_test.obs.to_csv("scenic-results/all-cond-test-set-meta.csv")
+#+end_src
+
+#+RESULTS:
+
+
+* Run Scenic
+** Scripts
+We will run scenic for the main loom object ~scenic-results/${PREFIX}.loom~ and then run AUCell for each of the small datasets we generated.
+
+#+begin_src shell
+eval "$(/home/main/miniconda3/bin/conda shell.bash hook)"
+conda activate scenicplus
+OBJS=(test_Treg_LCMV test_Treg_Naive test_CD8_LCMV test_CD8_Naive test_CD4_LCMV test_CD4_Naive)
+
+
+PREFIX="Treg-CD8-comb"
+LOOM_FILE=${PREFIX}.loom
+mkdir -p aucell
+# pyscenic grn $LOOM_FILE scenic/allTFs_mm.txt -o adj-$PREFIX.csv --num_workers 12
+
+## 10k - Enhancers
+TMP_PREFIX=${PREFIX}-10k
+# pyscenic ctx adj-${PREFIX}.csv scenic/mm10_10kb*feather --annotations_fname scenic/motifs-v10nr_clust-nr.mgi-m0.001-o0.0.tbl --expression_mtx_fname ${LOOM_FILE} --output reg-${TMP_PREFIX}.csv --mask_dropouts --num_workers 12
+
+TEST_FILE="all-cond-test-set"
+
+pyscenic aucell ${TEST_FILE}.loom reg-${TMP_PREFIX}.csv --output aucell/${TEST_FILE}-${TMP_PREFIX}-aucell.csv --num_workers 12
+
+for file in ${OBJS[@]};
+do
+    echo $file
+    # pyscenic aucell ${file}.loom reg-${TMP_PREFIX}.csv --output aucell/${file}-10k-aucell.csv --num_workers 12
+done
+
+
+## 500bp - Promoters
+TMP_PREFIX=${PREFIX}-500
+# pyscenic ctx adj-${PREFIX}.csv scenic/mm10_50*feather --annotations_fname scenic/motifs-v10nr_clust-nr.mgi-m0.001-o0.0.tbl --expression_mtx_fname ${LOOM_FILE} --output reg-${TMP_PREFIX}.csv --mask_dropouts --num_workers 12
+
+pyscenic aucell ${TEST_FILE}.loom reg-${TMP_PREFIX}.csv --output aucell/${TEST_FILE}-${TMP_PREFIX}-aucell.csv --num_workers 12
+# pyscenic aucell ${LOOM_FILE} reg-${TMP_PREFIX}.csv --output aucell/${TMP_PREFIX}-aucell.csv --num_workers 12
+
+for file in ${OBJS[@]};
+do
+    echo $file
+    # pyscenic aucell ${file}.loom reg-${TMP_PREFIX}.csv --output aucell/${file}-500-aucell.csv --num_workers 12
+done
+
+#+end_src
+** Project cells in the population
+
+After we calculated AUCell using scenics routine we want to get the regulons that are significantly differential expressed between the genotypes.
+
+#+begin_src python
+%cd /home/main/current_work/tigit/scenic-results
+import scanpy as sc
+import pandas as pd
+object_list = ["test_Treg_LCMV", "test_Treg_Naive", "test_CD8_LCMV", "test_CD8_Naive", "test_CD4_LCMV", "test_CD4_Naive"]
+
+def project_object(prefix, suffix="10k"):
+    ann = sc.read_loom(f"{prefix}.loom")
+    _meta_df = ann.obs
+    mask_wt = (_meta_df["Genotype"] == "WT").values
+    df_orig = pd.read_csv(f"aucell/{prefix}-{suffix}-aucell.csv", index_col = "Cell")
+    assert(all(df_orig.index == ann.obs_names))
+    ## Consider adding a t-test between the cells?
+    TIGIT = df_orig[~mask_wt].mean(axis=0)
+    WT = df_orig[mask_wt].mean(axis=0)
+    (TIGIT - WT).sort_values().to_csv(f"{prefix}-{suffix}-genotype.csv")
+    ann.obs.to_csv(f"{prefix}-meta.csv")
+    
+
+for obj in object_list:
+    project_object(obj)
+    project_object(obj, suffix = "500")
+#+end_src
+
+#+RESULTS:
+: /home/main/current_work/tigit/scenic-results
+
+* Visualize Final / Permutation tests
+#+begin_src R
+setwd("~/current_work/tigit")
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+ct = "all-cond-test-set"
+df = read.csv(paste0("scenic-results/", ct, "-meta.csv"), row.names = "CellID")
+suffix = "Treg-CD8-comb-500"
+
+df_auc = read.csv(paste0("scenic-results/aucell/", ct,"-", suffix, "-aucell.csv"), row.names="Cell")
+
+colnames(df_auc) = gsub("\\.\\.\\.", "", colnames(df_auc))
+TFs.orig =colnames(df_auc)
+
+df.all = merge(df, df_auc, by = "row.names")
+
+#+end_src
+
+#+RESULTS:
+
+#+begin_src R
+library(matrixStats)
+library(reshape2)
+
+diff2 = function(x, val){ log2(mean((x[val != "WT"])))-log2(mean(x[val == "WT"]))}
+wilcox = function(x,val){wilcox.test(x[val == "WT"], x[val != "WT"])}
+
+perm.test = function(x,val, perm=10000) {
+  n = 0
+  val.base = (val == "WT")
+  base.mean = abs(mean(x[!val.base]) - mean(x[val.base]))
+  for(i in 1:perm) {
+    ind = sample(length(x))
+    val.perm = (val[ind] == "WT")
+    base.null = abs(mean(x[!val.perm]) - mean(x[val.perm]))
+    if (1.2 * base.null >= base.mean) {
+      n = n+1
+    }
+  }
+  min(1 - n/perm, n/perm)
+}
+
+ct_var = "CellType"
+filter.regulons <- function(df.all,TFs) {
+  df.test = df.all %>%
+    group_by(Condition, !!rlang::sym(ct_var), Genotype) %>%
+    summarize(across(all_of(TFs), function(x) sum(x != 0)/length(x)))
+  TFs.active = TFs[colMaxs(as.matrix(df.test[,TFs])) > 0.3]
+  TFs.active
+}
+
+
+run.permutation <- function(df.all, TFs,ct_var = "CellType") {  
+  df.melt = melt(df.all, c("Genotype", "Condition", ct_var), TFs) #%>% filter(ct_short %in% c("Eff CD4", "Eff CD8", "Eff Tregs"))
+  pvals = df.melt %>%
+    group_by(Condition, !!rlang::sym(ct_var), variable) %>%
+    summarize(p.value = perm.test(value, Genotype), diff = diff2(value, Genotype)) %>%
+    arrange(p.value) %>%
+    ungroup()
+  pvals$padj = p.adjust(pvals$p.value, method = "holm")
+  pvals
+}
+
+## wilcox(value,Genotype)$p.value
+## t.test(value ~ Genotype,paired=FALSE)$p.value
+TFs = filter.regulons(df.all, TFs.orig)
+fn = paste0("scenic-results/scenic-genotype-",ct_var,"-",suffix,"-data.rds")
+## pvals = run.permutation(df.all, TFs)
+## saveRDS(pvals, paste0("scenic-results/scenic-genotype-",ct_var,"-",suffix,"-data.rds"))
+pvals = readRDS(fn)
+
+diff.table = as.data.frame(pvals %>% tidyr::pivot_wider(id_cols=c(Condition,!!rlang::sym(ct_var)), names_from=variable, values_from=diff))
+
+
+
+
+library(matrixStats)
+pval.table = as.data.frame(pvals %>% tidyr::pivot_wider(
+                                              id_cols=c(Condition, !!rlang::sym(ct_var)),
+                                                        names_from=variable,
+                                                        values_from=padj))
+## Sort infection condition
+new.index = order(diff.table$Condition,decreasing=T)
+diff.table = diff.table[new.index,]
+pval.table = pval.table[new.index,]
+
+X = diff.table[,TFs]
+rownames(X) = rownames(diff.table)
+
+
+library(pheatmap)
+diff.table$Condition = factor(diff.table$Condition, levels = c("Naive","LCMV"))
+diff.table$CellType = factor(diff.table$CellType, levels = c("CD4","CD8","Treg"))
+
+X.p = pval.table[,TFs]
+X.p[is.na(X.p)] = 1
+pval.annot = apply(X.p, 2, as.character)
+
+pval.annot[X.p > 0.05] = ""
+pval.annot[X.p < 0.05] = "*"
+pval.annot[X.p < 0.01] = "**"
+pval.annot[X.p < 0.001] = "***"
+
+mask = colnames(X.p)[(colMaxs(abs(log10(as.matrix(abs(X.p))))) > 3)]
+
+text = pval.annot ## structure(pval.annot, .Dim = c(length(diff.table[[ct_var]]), length(TFs)), .Dimnames = list(rownames(diff.table), TFs))
+
+
+breaks = seq(-0.5, 0.5,by=0.01)
+color = colorRampPalette(rev(RColorBrewer::brewer.pal(5, "RdYlBu")), interpolate="spline")(length(breaks))
+
+hm.palette = hue_pal()(5)
+celltype.cols = list(
+  Condition = c(Naive = hm.palette[c(5)], LCMV = hm.palette[c(2)]),
+  CellType = c(CD4 = hm.palette[c(1)], CD8 = hm.palette[c(3)], Treg = hm.palette[c(4)])
+)
+
+
+
+
+fig.height =  1 + length(mask) * 0.15
+gt = pheatmap(t(X[,mask]),
+              annotation_col=diff.table[,c(ct_var, "Condition")],
+              show_colnames= FALSE,
+              legend_breaks = c( -0.5, 0, 0.5),
+              breaks= breaks,
+              color = color,
+              cluster_col = FALSE,
+              display_numbers = t(text[,mask]),
+              fontsize=9,
+              fontsize_number = 8,              
+              annotation_colors = celltype.cols
+              )
+ggsave(paste0("scenic-results/scenic-genotype-",ct_var,"-",suffix,".pdf"), plot=gt, width = 4, height=fig.height)
+
+
+mask =  c("Prdm1", "Ets2", "Fos", "Ikzf2", "Junb", "Tcf7", "Irf4", "Jun", "Nfatc1", "Nfkb1", "Crem")
+## mask = c("Ets2", "Fos", "Ikzf2", "Junb", "Jun", "Nfatc1", "Nfkb2", "Nfil3", "Batf", "Gata3", "Crem", "Foxp3")
+fig.height =  1 + length(mask) * 0.15
+gt = pheatmap(t(X[,mask]),
+              annotation_col=diff.table[,c(ct_var, "Condition")],
+              show_colnames= FALSE,
+              legend_breaks = c( -0.5, 0, 0.5),
+              breaks= breaks,
+              color = color,
+              cluster_col = FALSE,
+              display_numbers = t(text[,mask]),
+              fontsize=9,
+              fontsize_number = 8,              
+              annotation_colors = celltype.cols
+              )
+ggsave(paste0("scenic-results/scenic-genotype-",ct_var,"-",suffix,"-selected.pdf"), plot=gt, width = 4, height=fig.height)
+
+#+end_src
+
+#+RESULTS:
+: [1m[22m`summarise()` has grouped output by 'Condition', 'CellType'. You can override using the `.groups` argument.
+
+
